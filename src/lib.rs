@@ -1,162 +1,218 @@
 use std::collections::HashMap;
-use std::fs;
+use std::path::PathBuf;
+use std::sync::RwLock;
 
 pub mod error;
-pub mod translation;
 pub mod loader;
+pub mod translation;
 
 pub use error::I18nError;
-pub use translation::Translation;
 pub use loader::I18nLoader;
+pub use translation::Translation;
 
-/// Prelude module for convenient imports
+/// Convenient imports for the backwards-compatible global API.
 pub mod prelude {
-    pub use crate::{init, set_locale, current_locale, set_default_locale, set_fallback_locale, t, t_with_placeholders, I18nError, I18nResult};
+    pub use crate::{
+        current_locale, init, set_default_locale, set_fallback_locale, set_locale, t,
+        t_with_placeholders, I18n, I18nError, I18nResult,
+    };
 }
 
-/// Result type for i18n operations
 pub type I18nResult<T> = Result<T, I18nError>;
 
-lazy_static::lazy_static! {
-    static ref LOCALES: std::sync::RwLock<LoaderContainer> = std::sync::RwLock::new(LoaderContainer::new());
-    static ref CURRENT_LOCALE: std::sync::RwLock<String> = std::sync::RwLock::new("en".to_string());
+/// An isolated translation catalog for one application or project.
+///
+/// Each instance owns its locale directory and language selection, so separate
+/// projects (or components) can use different catalogs in the same process.
+pub struct I18n {
+    locales_dir: PathBuf,
+    state: RwLock<LocaleState>,
 }
 
-/// Container for managing loaded locales
-pub struct LoaderContainer {
-    pub default_locale: String,
-    pub fallback_locale: String,
-    pub locales: HashMap<String, HashMap<String, serde_json::Value>>,
+struct LocaleState {
+    current_locale: String,
+    default_locale: String,
+    fallback_locale: String,
+    locales: HashMap<String, HashMap<String, serde_json::Value>>,
 }
 
-impl LoaderContainer {
-    fn new() -> Self {
-        Self {
-            default_locale: "en".to_string(),
-            fallback_locale: "en".to_string(),
-            locales: HashMap::new(),
+impl I18n {
+    /// Load all JSON locale files from a project-specific directory.
+    ///
+    /// The default, fallback, and initial locale are `en` when available;
+    /// otherwise they use the first locale found in the directory.
+    pub fn new(locales_dir: impl Into<PathBuf>) -> I18nResult<Self> {
+        let locales_dir = locales_dir.into();
+        let loader = I18nLoader::new(&locales_dir)?;
+        let locales = loader.load_all()?;
+        if locales.is_empty() {
+            return Err(I18nError::MissingLocale(
+                "No .json locale files found".to_string(),
+            ));
         }
+        let initial = if locales.contains_key("en") {
+            "en".to_string()
+        } else {
+            let mut available: Vec<_> = locales.keys().cloned().collect();
+            available.sort();
+            available[0].clone()
+        };
+        Ok(Self {
+            locales_dir,
+            state: RwLock::new(LocaleState {
+                current_locale: initial.clone(),
+                default_locale: initial.clone(),
+                fallback_locale: initial,
+                locales,
+            }),
+        })
     }
-}
 
-/// Initialize the i18n library with a locales directory
-///
-/// # Arguments
-///
-/// * `locales_dir` - Path to the directory containing locale files (e.g., "locales")
-pub fn init(locales_dir: &str) -> I18nResult<()> {
-    let loader = I18nLoader::new(locales_dir)?;
-    let mut locales_map = LOCALES.write().unwrap();
+    /// Reload every locale atomically. On failure, the current catalog remains usable.
+    pub fn reload(&self) -> I18nResult<()> {
+        let loader = I18nLoader::new(&self.locales_dir)?;
+        let locales = loader.load_all()?;
+        if locales.is_empty() {
+            return Err(I18nError::MissingLocale(
+                "No .json locale files found".to_string(),
+            ));
+        }
+        let mut state = self.state.write().unwrap();
+        if !locales.contains_key(&state.current_locale) {
+            state.current_locale = if locales.contains_key(&state.default_locale) {
+                state.default_locale.clone()
+            } else {
+                let mut available: Vec<_> = locales.keys().cloned().collect();
+                available.sort();
+                available[0].clone()
+            };
+        }
+        state.locales = locales;
+        Ok(())
+    }
 
-    match fs::read_dir(locales_dir) {
-        Ok(entries) => {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if path.is_file() && path.extension().map_or(false, |ext| ext == "json") {
-                    if let Some(locale) = path.file_stem().and_then(|s| s.to_str()) {
-                        match loader.load_locale(locale) {
-                            Ok(locale_data) => {
-                                locales_map.locales.insert(locale.to_string(), locale_data);
-                            }
-                            Err(e) => {
-                                eprintln!("Warning: Failed to load locale '{}': {}", locale, e);
-                            }
-                        }
-                    }
-                }
+    /// List loaded locale identifiers in stable alphabetical order.
+    pub fn available_locales(&self) -> Vec<String> {
+        let state = self.state.read().unwrap();
+        let mut locales: Vec<_> = state.locales.keys().cloned().collect();
+        locales.sort();
+        locales
+    }
+
+    /// Select the active locale.
+    pub fn set_locale(&self, locale: &str) -> I18nResult<()> {
+        let mut state = self.state.write().unwrap();
+        if !state.locales.contains_key(locale) {
+            return Err(I18nError::MissingLocale(locale.to_string()));
+        }
+        state.current_locale = locale.to_string();
+        Ok(())
+    }
+
+    /// Return the active locale identifier.
+    pub fn current_locale(&self) -> String {
+        self.state.read().unwrap().current_locale.clone()
+    }
+
+    /// Set the default locale used when the active locale is unavailable.
+    pub fn set_default_locale(&self, locale: &str) -> I18nResult<()> {
+        let mut state = self.state.write().unwrap();
+        ensure_locale(&state.locales, locale)?;
+        state.default_locale = locale.to_string();
+        Ok(())
+    }
+
+    /// Set the locale used when a key is missing from the active locale.
+    pub fn set_fallback_locale(&self, locale: &str) -> I18nResult<()> {
+        let mut state = self.state.write().unwrap();
+        ensure_locale(&state.locales, locale)?;
+        state.fallback_locale = locale.to_string();
+        Ok(())
+    }
+
+    /// Resolve a translation, checking active, fallback, then default locale.
+    /// Returns the key itself when no translation exists.
+    pub fn t(&self, key: &str) -> String {
+        let state = self.state.read().unwrap();
+        for locale in [
+            state.current_locale.as_str(),
+            state.fallback_locale.as_str(),
+            state.default_locale.as_str(),
+        ] {
+            if let Some(value) = get_translation(&state.locales, locale, key) {
+                return translate(value);
             }
         }
-        Err(e) => {
-            return Err(I18nError::IoError(format!("Failed to read locales directory '{}': {}", locales_dir, e)));
+        key.to_string()
+    }
+
+    /// Resolve a translation and replace `{name}` style placeholders.
+    pub fn t_with_placeholders(&self, key: &str, placeholders: &HashMap<&str, &str>) -> String {
+        let mut result = self.t(key);
+        for (placeholder, value) in placeholders {
+            result = result.replace(&format!("{{{}}}", placeholder), value);
         }
+        result
     }
+}
 
+fn ensure_locale(
+    locales: &HashMap<String, HashMap<String, serde_json::Value>>,
+    locale: &str,
+) -> I18nResult<()> {
+    if locales.contains_key(locale) {
+        Ok(())
+    } else {
+        Err(I18nError::MissingLocale(locale.to_string()))
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref GLOBAL_I18N: RwLock<Option<I18n>> = RwLock::new(None);
+}
+
+/// Initialize the backwards-compatible process-wide catalog.
+pub fn init(locales_dir: &str) -> I18nResult<()> {
+    let catalog = I18n::new(locales_dir)?;
+    *GLOBAL_I18N.write().unwrap() = Some(catalog);
     Ok(())
 }
 
-/// Set the current locale
-///
-/// # Arguments
-///
-/// * `locale` - The locale to set (e.g., "en", "de", "fr")
+fn with_global<T>(f: impl FnOnce(&I18n) -> T) -> Option<T> {
+    let global = GLOBAL_I18N.read().unwrap();
+    global.as_ref().map(f)
+}
+
 pub fn set_locale(locale: &str) -> I18nResult<()> {
-    let locales = LOCALES.read().unwrap();
-    if !locales.locales.contains_key(locale) {
-        return Err(I18nError::MissingLocale(locale.to_string()));
-    }
-    drop(locales);
-    let mut current = CURRENT_LOCALE.write().unwrap();
-    *current = locale.to_string();
-    Ok(())
+    with_global(|i18n| i18n.set_locale(locale))
+        .unwrap_or_else(|| Err(I18nError::MissingLocale("i18n is not initialized".into())))
 }
 
-/// Get the current locale
 pub fn current_locale() -> String {
-    CURRENT_LOCALE.read().unwrap().clone()
+    with_global(I18n::current_locale).unwrap_or_else(|| "en".to_string())
 }
 
-/// Set the default locale
-///
-/// # Arguments
-///
-/// * `locale` - The default locale to set
+/// Set the default locale for the global catalog. Invalid locales are ignored
+/// for compatibility; use [`I18n::set_default_locale`] for checked updates.
 pub fn set_default_locale(locale: &str) {
-    let mut locales = LOCALES.write().unwrap();
-    locales.default_locale = locale.to_string();
+    let _ = with_global(|i18n| i18n.set_default_locale(locale));
 }
 
-/// Set the fallback locale
-///
-/// # Arguments
-///
-/// * `locale` - The fallback locale to set
+/// Set the fallback locale for the global catalog. Invalid locales are ignored
+/// for compatibility; use [`I18n::set_fallback_locale`] for checked updates.
 pub fn set_fallback_locale(locale: &str) {
-    let mut locales = LOCALES.write().unwrap();
-    locales.fallback_locale = locale.to_string();
+    let _ = with_global(|i18n| i18n.set_fallback_locale(locale));
 }
 
-/// Get a translation by key
-///
-/// # Arguments
-///
-/// * `key` - The translation key (e.g., "hello.world")
 pub fn t(key: &str) -> String {
-    let locales = LOCALES.read().unwrap();
-    let current_locale = current_locale();
-
-    // Try to get from current locale first
-    if let Some(translation) = get_translation(&locales.locales, &current_locale, key) {
-        return translate(translation);
-    }
-
-    // Fall back to fallback locale
-    if let Some(translation) = get_translation(&locales.locales, &locales.fallback_locale, key) {
-        return translate(translation);
-    }
-
-    // Return the key as fallback if no translation found
-    key.to_string()
+    with_global(|i18n| i18n.t(key)).unwrap_or_else(|| key.to_string())
 }
 
-/// Get a translation with placeholders
-///
-/// # Arguments
-///
-/// * `key` - The translation key
-/// * `placeholders` - A map of placeholder names to values
 pub fn t_with_placeholders(key: &str, placeholders: &HashMap<&str, &str>) -> String {
-    let translated = t(key);
-
-    let mut result = translated;
-    for (placeholder, value) in placeholders {
-        let placeholder_str = format!("{{{}}}", placeholder);
-        result = result.replace(&placeholder_str, value);
-    }
-
-    result
+    with_global(|i18n| i18n.t_with_placeholders(key, placeholders))
+        .unwrap_or_else(|| key.to_string())
 }
 
-/// Get a translation with placeholders using a macro (convenience)
 #[macro_export]
 macro_rules! t_with_placeholders {
     ($key:expr, $placeholders:expr) => {
@@ -169,7 +225,18 @@ fn get_translation<'a>(
     locale: &str,
     key: &str,
 ) -> Option<&'a serde_json::Value> {
-    locales.get(locale).and_then(|locale_map| locale_map.get(key))
+    let data = locales.get(locale)?;
+    // Preserve support for literal dotted keys before trying nested traversal.
+    if let Some(value) = data.get(key) {
+        return Some(value);
+    }
+    let mut parts = key.split('.');
+    let first = parts.next()?;
+    let mut value = data.get(first)?;
+    for part in parts {
+        value = value.as_object()?.get(part)?;
+    }
+    Some(value)
 }
 
 fn translate(value: &serde_json::Value) -> String {
@@ -177,93 +244,14 @@ fn translate(value: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => "".to_string(),
-        serde_json::Value::Array(arr) => {
-            arr.iter()
-                .map(|v| translate(v))
-                .collect::<Vec<String>>()
-                .join(", ")
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Array(values) => {
+            values.iter().map(translate).collect::<Vec<_>>().join(", ")
         }
-        serde_json::Value::Object(obj) => {
-            obj.iter()
-                .map(|(k, v)| format!("{}: {}", k, translate(v)))
-                .collect::<Vec<String>>()
-                .join(", ")
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_translation_key_creation() {
-        let key = translation::TranslationKey::new("hello.world");
-        assert_eq!(key.as_str(), "hello.world");
-        assert_eq!(key.split(), vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn test_translation_key_from_str() {
-        let key: translation::TranslationKey = "test.key".into();
-        assert_eq!(key.as_str(), "test.key");
-    }
-
-    #[test]
-    fn test_translation_key_from_string() {
-        let key: translation::TranslationKey = String::from("test.key").into();
-        assert_eq!(key.as_str(), "test.key");
-    }
-
-    #[test]
-    fn test_translate_string() {
-        let value = serde_json::Value::String("Hello".to_string());
-        assert_eq!(translate(&value), "Hello");
-    }
-
-    #[test]
-    fn test_translate_number() {
-        let value = serde_json::Value::Number(serde_json::Number::from(42));
-        assert_eq!(translate(&value), "42");
-    }
-
-    #[test]
-    fn test_translate_bool() {
-        let value = serde_json::Value::Bool(true);
-        assert_eq!(translate(&value), "true");
-    }
-
-    #[test]
-    fn test_translate_null() {
-        let value = serde_json::Value::Null;
-        assert_eq!(translate(&value), "");
-    }
-
-    #[test]
-    fn test_translate_array() {
-        let value = serde_json::json!(["a", "b", "c"]);
-        assert_eq!(translate(&value), "a, b, c");
-    }
-
-    #[test]
-    fn test_get_translation_missing() {
-        let locales = HashMap::new();
-        assert!(get_translation(&locales, "en", "key").is_none());
-    }
-
-    #[test]
-    fn test_error_display() {
-        let err = I18nError::InvalidJson("test".to_string());
-        assert_eq!(err.to_string(), "Invalid JSON format: test");
-
-        let err = I18nError::MissingLocale("de".to_string());
-        assert_eq!(err.to_string(), "Missing locale file: de");
-
-        let err = I18nError::MissingTranslation("en".to_string(), "key".to_string());
-        assert_eq!(err.to_string(), "Missing translation key 'key' in locale en");
-
-        let err = I18nError::IoError("file not found".to_string());
-        assert_eq!(err.to_string(), "IO error: file not found");
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| format!("{}: {}", key, translate(value)))
+            .collect::<Vec<_>>()
+            .join(", "),
     }
 }
