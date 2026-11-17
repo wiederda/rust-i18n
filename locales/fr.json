@@ -1,0 +1,9 @@
+{
+    "hello": "Bonjour",
+    "greeting": "Bonjour",
+    "welcome.user": "Bienvenue {name}",
+    "file.count": "Vous avez {count} fichiers",
+    "status.success": "Opération terminée avec succès",
+    "error.not_found": "Ressource non trouvée",
+    "app.title": "Mon Application"
+}

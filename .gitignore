@@ -1,0 +1,21 @@
+# Build artifacts
+target/
+**/*.rs.bk
+Feature.md
+
+# Cargo.lock is not needed for libraries
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+tests/locales/
